@@ -165,8 +165,47 @@ export const StudyProvider: React.FC<{ children: ReactNode }> = ({ children }) =
   });
 
   const [celebrationEvent, setCelebrationEvent] = useState<CelebrationEvent | null>(null);
-
   const [activeSession, setActiveSession] = useState<StudyContextType['activeSession']>(null);
+
+  // Synchronization refs to prevent circular updates and write stream exhaustion
+  const lastSyncedPayloadRef = useRef<string>('');
+  const isRemoteUpdateRef = useRef<boolean>(false);
+  const isWritingRef = useRef<boolean>(false);
+  const syncCooldownUntilRef = useRef<number>(0);
+  const pendingWriteAfterCurrentRef = useRef<boolean>(false);
+
+  // Helper to deterministically serialize current study state for dirty checking
+  const serializeState = useCallback((
+    p: StudentProfile,
+    s: StudyStreak,
+    subs: Subject[],
+    mats: StudyMaterial[],
+    fcs: Flashcard[],
+    qzs: Quiz[],
+    qres: QuizResult[],
+    splans: Record<string, StudyPlan>,
+    wtops: WeakTopic[],
+    recs: AIRecommendation[],
+    cthreads: ChatThread[]
+  ): string => {
+    try {
+      return JSON.stringify({
+        profile: p,
+        studyStreak: s,
+        subjects: subs,
+        materials: mats,
+        flashcards: fcs,
+        quizzes: qzs,
+        quizResults: qres,
+        studyPlans: splans,
+        weakTopics: wtops,
+        recommendations: recs,
+        chatThreads: cthreads
+      });
+    } catch {
+      return '';
+    }
+  }, []);
 
   // Compute live streak evaluation (checking if consecutive days maintained or pending today's study)
   const streakEvaluation = evaluateStreak(
@@ -204,7 +243,7 @@ export const StudyProvider: React.FC<{ children: ReactNode }> = ({ children }) =
     setCelebrationEvent(null);
   }, []);
 
-  // Record study activity in Firestore and locally
+  // Record study activity in state and trigger celebration if applicable
   const recordStudyActivity = useCallback(async (
     minutesAdded: number = 15,
     activityName: string = 'Study Activity'
@@ -218,28 +257,11 @@ export const StudyProvider: React.FC<{ children: ReactNode }> = ({ children }) =
       setCelebrationEvent(result.celebration);
     }
 
-    // Direct Firestore write if signed in
-    if (user?.uid) {
-      try {
-        const userDocRef = doc(db, 'users', user.uid);
-        await setDoc(userDocRef, {
-          studyStreak: result.updatedStreak,
-          profile: {
-            ...profile,
-            ...result.updatedProfile
-          },
-          updatedAt: new Date().toISOString()
-        }, { merge: true });
-      } catch (err) {
-        console.warn('Direct Firestore streak sync notice:', err);
-      }
-    }
-
     return {
       newStreak: result.updatedStreak.currentStreak,
       celebration: result.celebration
     };
-  }, [studyStreak, profile, user]);
+  }, [studyStreak, profile]);
 
   // Sync to localStorage
   useEffect(() => {
@@ -287,8 +309,32 @@ export const StudyProvider: React.FC<{ children: ReactNode }> = ({ children }) =
 
             if (snap.exists()) {
               const data = snap.data();
+
+              // Compute serialized representation of the incoming data
+              const incomingPayload = serializeState(
+                data.profile || INITIAL_PROFILE,
+                data.studyStreak || INITIAL_STUDY_STREAK,
+                Array.isArray(data.subjects) ? data.subjects : INITIAL_SUBJECTS,
+                Array.isArray(data.materials) ? data.materials : INITIAL_MATERIALS,
+                Array.isArray(data.flashcards) ? data.flashcards : INITIAL_FLASHCARDS,
+                Array.isArray(data.quizzes) ? data.quizzes : [],
+                Array.isArray(data.quizResults) ? data.quizResults : INITIAL_QUIZ_RESULTS,
+                data.studyPlans || {},
+                Array.isArray(data.weakTopics) ? data.weakTopics : INITIAL_WEAK_TOPICS,
+                Array.isArray(data.recommendations) ? data.recommendations : INITIAL_RECOMMENDATIONS,
+                Array.isArray(data.chatThreads) ? data.chatThreads : []
+              );
+
+              // If identical to what we already synced or hold, skip setting state to prevent loops
+              if (incomingPayload === lastSyncedPayloadRef.current) {
+                return;
+              }
+
               // Only hydrate from server if the update did not originate from local in-flight writes
               if (!snap.metadata.hasPendingWrites) {
+                isRemoteUpdateRef.current = true;
+                lastSyncedPayloadRef.current = incomingPayload;
+
                 if (data.profile) setProfile(data.profile);
                 if (data.studyStreak) setStudyStreak(data.studyStreak);
                 if (Array.isArray(data.subjects)) setSubjects(data.subjects);
@@ -303,6 +349,21 @@ export const StudyProvider: React.FC<{ children: ReactNode }> = ({ children }) =
               }
             } else {
               // First time user: initialize cloud document with starter course state
+              const initialPayload = serializeState(
+                profile,
+                studyStreak,
+                subjects,
+                materials,
+                flashcards,
+                quizzes,
+                quizResults,
+                studyPlans,
+                weakTopics,
+                recommendations,
+                chatThreads
+              );
+              lastSyncedPayloadRef.current = initialPayload;
+
               setDoc(userDocRef, {
                 profile: {
                   ...profile,
@@ -321,14 +382,21 @@ export const StudyProvider: React.FC<{ children: ReactNode }> = ({ children }) =
                 chatThreads,
                 updatedAt: new Date().toISOString()
               }).catch((err) => {
-                handleFirestoreError(err, OperationType.WRITE, `users/${currentUser.uid}`);
+                if (err?.message && (err.message.includes('permission') || err.message.includes('Missing or insufficient'))) {
+                  handleFirestoreError(err, OperationType.WRITE, `users/${currentUser.uid}`);
+                }
               });
             }
           },
           (err) => {
             setIsSyncing(false);
-            console.warn('Real-time Firestore sync error:', err);
-            handleFirestoreError(err, OperationType.GET, `users/${currentUser.uid}`);
+            console.warn('Real-time Firestore sync notice:', err);
+            // Only throw permission errors per skill requirements
+            if (err?.message && (err.message.includes('permission') || err.message.includes('Missing or insufficient'))) {
+              handleFirestoreError(err, OperationType.GET, `users/${currentUser.uid}`);
+            } else if (err?.message && (err.message.includes('resource-exhausted') || err.message.includes('queued writes'))) {
+              setIsRealtimeActive(false);
+            }
           }
         );
       } else {
@@ -343,14 +411,47 @@ export const StudyProvider: React.FC<{ children: ReactNode }> = ({ children }) =
       if (unsubscribeDoc) unsubscribeDoc();
       unsubscribeAuth();
     };
-  }, []);
+  }, [serializeState]);
 
   // Sync to user-isolated Firestore document
   const syncToFirestore = useCallback(async (currentUserId?: string) => {
     const uid = currentUserId || user?.uid;
     if (!uid) return;
+
+    // Check backoff cooldown
+    if (Date.now() < syncCooldownUntilRef.current) {
+      return;
+    }
+
+    // Check if write is already in flight
+    if (isWritingRef.current) {
+      pendingWriteAfterCurrentRef.current = true;
+      return;
+    }
+
+    const currentPayload = serializeState(
+      profile,
+      studyStreak,
+      subjects,
+      materials,
+      flashcards,
+      quizzes,
+      quizResults,
+      studyPlans,
+      weakTopics,
+      recommendations,
+      chatThreads
+    );
+
+    // If data hasn't changed since last sync, no need to write!
+    if (currentPayload && currentPayload === lastSyncedPayloadRef.current) {
+      return;
+    }
+
+    isWritingRef.current = true;
+    setIsSyncing(true);
+
     try {
-      setIsSyncing(true);
       const userDocRef = doc(db, 'users', uid);
       await setDoc(userDocRef, {
         profile,
@@ -366,13 +467,31 @@ export const StudyProvider: React.FC<{ children: ReactNode }> = ({ children }) =
         chatThreads,
         updatedAt: new Date().toISOString()
       }, { merge: true });
-    } catch (e) {
-      console.warn('Firestore sync notice:', e);
-      handleFirestoreError(e, OperationType.WRITE, `users/${uid}`);
+
+      lastSyncedPayloadRef.current = currentPayload;
+      setLastRealtimeSync(new Date());
+    } catch (e: any) {
+      const errorMsg = e?.message || String(e);
+      console.warn('Firestore sync notice:', errorMsg);
+
+      // If resource exhausted or maximum queued writes, apply a cooldown to let the write stream drain
+      if (errorMsg.includes('resource-exhausted') || errorMsg.includes('queued writes') || errorMsg.includes('backoff')) {
+        syncCooldownUntilRef.current = Date.now() + 25000;
+      } else if (errorMsg.includes('permission') || errorMsg.includes('Missing or insufficient')) {
+        handleFirestoreError(e, OperationType.WRITE, `users/${uid}`);
+      }
     } finally {
+      isWritingRef.current = false;
       setIsSyncing(false);
+
+      if (pendingWriteAfterCurrentRef.current) {
+        pendingWriteAfterCurrentRef.current = false;
+        setTimeout(() => {
+          syncToFirestore(uid);
+        }, 1500);
+      }
     }
-  }, [user, profile, studyStreak, subjects, materials, flashcards, quizzes, quizResults, studyPlans, weakTopics, recommendations, chatThreads]);
+  }, [user, profile, studyStreak, subjects, materials, flashcards, quizzes, quizResults, studyPlans, weakTopics, recommendations, chatThreads, serializeState]);
 
   // Debounced auto-sync to Firestore whenever state changes and user is signed in
   const isInitialMount = useRef(true);
@@ -383,12 +502,37 @@ export const StudyProvider: React.FC<{ children: ReactNode }> = ({ children }) =
     }
     if (!user?.uid) return;
 
+    // If this state update was triggered by remote snapshot hydration, do not send it back!
+    if (isRemoteUpdateRef.current) {
+      isRemoteUpdateRef.current = false;
+      return;
+    }
+
+    const currentPayload = serializeState(
+      profile,
+      studyStreak,
+      subjects,
+      materials,
+      flashcards,
+      quizzes,
+      quizResults,
+      studyPlans,
+      weakTopics,
+      recommendations,
+      chatThreads
+    );
+
+    // If local state hasn't changed compared to synced state, skip write
+    if (currentPayload && currentPayload === lastSyncedPayloadRef.current) {
+      return;
+    }
+
     const timer = setTimeout(() => {
       syncToFirestore(user.uid);
-    }, 1500);
+    }, 3000);
 
     return () => clearTimeout(timer);
-  }, [user?.uid, profile, studyStreak, subjects, materials, flashcards, quizzes, quizResults, studyPlans, weakTopics, recommendations, chatThreads, syncToFirestore]);
+  }, [user?.uid, profile, studyStreak, subjects, materials, flashcards, quizzes, quizResults, studyPlans, weakTopics, recommendations, chatThreads, serializeState, syncToFirestore]);
 
   const saveChatThread = (thread: ChatThread) => {
     setChatThreads(prev => {

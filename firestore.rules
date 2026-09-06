@@ -14,6 +14,11 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Test connection endpoint
+    match /test/{docId} {
+      allow read: if true;
+    }
+
     // Isolated student user profile and learning data
     match /users/{userId} {
       allow read, write: if isOwner(userId);
