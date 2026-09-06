@@ -1,0 +1,67 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile, study materials, quizzes, and adaptive learning state",
+      "type": "object",
+      "properties": {
+        "profile": {
+          "type": "object",
+          "description": "Student profile info including name, college, major, and pace"
+        },
+        "subjects": {
+          "type": "array",
+          "description": "List of student subjects and modules"
+        },
+        "materials": {
+          "type": "array",
+          "description": "Uploaded study notes, summaries, and extracted formulas"
+        },
+        "flashcards": {
+          "type": "array",
+          "description": "Active recall study flashcards"
+        },
+        "quizzes": {
+          "type": "array",
+          "description": "Generated quizzes and assessments"
+        },
+        "quizResults": {
+          "type": "array",
+          "description": "Historical quiz attempts and performance records"
+        },
+        "studyPlans": {
+          "type": "array",
+          "description": "Generated study calendars and day-by-day tasks"
+        },
+        "weakTopics": {
+          "type": "array",
+          "description": "Detected weak concepts needing targeted review"
+        },
+        "recommendations": {
+          "type": "array",
+          "description": "Personalized study recommendations"
+        },
+        "chatThreads": {
+          "type": "array",
+          "description": "Multi-turn Gemini AI tutor conversations with thread history"
+        },
+        "studyStreak": {
+          "type": "object",
+          "description": "Study streak tracking including currentStreak, longestStreak, lastStudyDate, and daily study history"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO timestamp of last state sync"
+        }
+      },
+      "required": ["profile", "subjects", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Per-user isolated storage for learning profile and course materials"
+    }
+  }
+}

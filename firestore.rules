@@ -1,0 +1,33 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Isolated student user profile and learning data
+    match /users/{userId} {
+      allow read, write: if isOwner(userId);
+
+      match /{subCollection=**} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // Public templates and sample curricula
+    match /public/{document=**} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+  }
+}
+

@@ -1,0 +1,6 @@
+{
+  "name": "StudyMate AI",
+  "description": "An agentic AI study platform for college students with personalized tutoring, adaptive quizzes, and study plans.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
